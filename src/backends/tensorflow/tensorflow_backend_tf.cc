@@ -165,14 +165,28 @@ NewSessionOptions(
     const bool allow_gpu_memory_growth,
     const float per_process_gpu_memory_fraction,
     const bool allow_soft_placement,
-    tensorflow::SessionOptions* session_options)
+    tensorflow::SessionOptions* session_options,
+    const int num_virtual_devices=2)
 {
+  tensorflow::ConfigProto* conf = &(session_options->config);
+  (*conf->mutable_device_count())["GPU"] = 1;
+
+  session_options->config.mutable_gpu_options()->set_visible_device_list("0");
   session_options->config.mutable_gpu_options()->set_allow_growth(
       allow_gpu_memory_growth);
   session_options->config.mutable_gpu_options()
-      ->set_per_process_gpu_memory_fraction(per_process_gpu_memory_fraction);
+      ->set_per_process_gpu_memory_fraction(0);
   session_options->config.set_allow_soft_placement(allow_soft_placement);
 
+  const std::vector<std::vector<float>> memory_limit_mb = {{5000,5000}};
+  for (const auto& v : memory_limit_mb) {
+    auto virtual_devices =
+        session_options->config.mutable_gpu_options()
+            ->mutable_experimental()->add_virtual_devices();
+    for (float mb : v) {
+      virtual_devices->add_memory_limit_mb(mb);
+    }
+  }
   // Enable/disable XLA based on the model config optimization
   // setting.
   tensorflow::OptimizerOptions::GlobalJitLevel xla =

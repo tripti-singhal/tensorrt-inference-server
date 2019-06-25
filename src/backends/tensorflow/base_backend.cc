@@ -72,21 +72,6 @@ BaseBackend::CreateExecutionContexts(
     }
   }
 
-  tensorflow::ConfigProto new_session_config = session_config;
-  tensorflow::ConfigProto* conf = &new_session_config;
-
-  (*conf->mutable_device_count())["GPU"] = 1;
-  tensorflow::GPUOptions* gpu_options = new_session_config.mutable_gpu_options();
-  gpu_options->set_visible_device_list("0");
-  const std::vector<std::vector<float>> memory_limit_mb = {{2500}};
-  //gpu_options->set_per_process_gpu_memory_fraction(per_process_gpu_memory_fraction);
-  for (const auto& v : memory_limit_mb) {
-    auto virtual_devices =
-        gpu_options->mutable_experimental()->add_virtual_devices();
-    for (float mb : v) {
-      virtual_devices->add_memory_limit_mb(mb);
-    }
-  }
   uint32_t total_context_cnt = 0;
 
   for (const auto& group : Config().instance_group()) {
@@ -97,14 +82,14 @@ BaseBackend::CreateExecutionContexts(
         const std::string instance_name =
             group.name() + "_" + std::to_string(c) + "_cpu";
         RETURN_IF_ERROR(CreateExecutionContext(
-            instance_name, Context::NO_GPU_DEVICE, new_session_config, paths));
+            instance_name, Context::NO_GPU_DEVICE, backend_config, paths));
         total_context_cnt++;
       } else {
         const std::string instance_name = group.name() + "_" +
                                           std::to_string(c) + "_gpu" +
                                           std::to_string(c);
         RETURN_IF_ERROR(CreateExecutionContext(
-            instance_name, c, new_session_config, paths));
+            instance_name, c, backend_config, paths));
         total_context_cnt++;
       }
     }
@@ -184,7 +169,6 @@ BaseBackend::CreateExecutionContext(
 
   RETURN_IF_ERROR(context->ValidateInputs(Config().input()));
   RETURN_IF_ERROR(context->ValidateOutputs(Config().output()));
-
   RETURN_IF_ERROR(CreateTRTISTFModel(
       graphdef_backend_config, gpu_device, Config().optimization().has_graph(),
       Config().optimization().graph().level(), gdp_itr->second,
