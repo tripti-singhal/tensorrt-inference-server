@@ -175,10 +175,10 @@ NewSessionOptions(
   session_options->config.mutable_gpu_options()->set_allow_growth(
       allow_gpu_memory_growth);
   session_options->config.mutable_gpu_options()
-      ->set_per_process_gpu_memory_fraction(0);
+      ->set_per_process_gpu_memory_fraction(0.25);
   session_options->config.set_allow_soft_placement(allow_soft_placement);
 
-  const std::vector<std::vector<float>> memory_limit_mb = {{5000,5000}};
+  const std::vector<std::vector<float>> memory_limit_mb = {{2500,2500}};
   for (const auto& v : memory_limit_mb) {
     auto virtual_devices =
         session_options->config.mutable_gpu_options()
