@@ -428,6 +428,7 @@ InferResponseProvider::FinalizeResponse(const InferenceBackend& is)
       }
       skip_batch = false;
     }
+    LOG_VERBOSE(1) << "Infer o/p Shape: " << DimsListToString(batch1_backend_shape);
 
     const DimsList& expected_shape = (output_config->has_reshape())
                                          ? output_config->reshape().shape()

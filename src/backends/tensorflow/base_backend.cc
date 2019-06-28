@@ -462,6 +462,7 @@ ReadStringOutputTensor(
         payload.request_provider_->RequestHeader();
     const size_t expected_element_cnt =
         request_header.batch_size() * batch1_element_cnt;
+    LOG_VERBOSE(1) << "expected_element_cnt: " << expected_element_cnt;
 
     // If 'payload' requested this output then copy it from the
     // GPU. If it did not request this output then just skip it in
@@ -480,6 +481,7 @@ ReadStringOutputTensor(
         if (len > 0) {
           serialized.append(cstr);
         }
+        LOG_VERBOSE(1) << "serialized[" << e <<  "]: " << cstr;
       }
 
       void* content;
@@ -709,6 +711,8 @@ BaseBackend::Context::Run(
     const DimsList& output_dims = (output_config->has_reshape())
                                       ? output_config->reshape().shape()
                                       : output_config->dims();
+    LOG_VERBOSE(1) << "batch1_element_cnt is: " << batch1_element_cnt;
+    LOG_VERBOSE(1) << name + " inference shape is: " + DimsListToString(shapevec);
 
     // verify shape of output matches shape from model config
     const int batch_offset = ((max_batch_size_ == NO_BATCHING) ? 0 : 1);
@@ -743,6 +747,7 @@ BaseBackend::Context::Run(
       ReadFixedSizedOutputTensor(
           output_tensor, name, shapevec, batch1_byte_size, payloads);
     } else {
+      LOG_VERBOSE(1) << "Hit string tensor part";
       ReadStringOutputTensor(
           output_tensor, name, shapevec, batch1_element_cnt, payloads);
     }
