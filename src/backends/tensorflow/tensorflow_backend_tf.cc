@@ -165,8 +165,7 @@ NewSessionOptions(
     const bool allow_gpu_memory_growth,
     const float per_process_gpu_memory_fraction,
     const bool allow_soft_placement,
-    tensorflow::SessionOptions* session_options,
-    const int num_virtual_devices=2)
+    tensorflow::SessionOptions* session_options)
 {
   tensorflow::ConfigProto* conf = &(session_options->config);
   (*conf->mutable_device_count())["GPU"] = 1;
@@ -175,10 +174,10 @@ NewSessionOptions(
   session_options->config.mutable_gpu_options()->set_allow_growth(
       allow_gpu_memory_growth);
   session_options->config.mutable_gpu_options()
-      ->set_per_process_gpu_memory_fraction(0.25);
+      ->set_per_process_gpu_memory_fraction(per_process_gpu_memory_fraction);
   session_options->config.set_allow_soft_placement(allow_soft_placement);
 
-  const std::vector<std::vector<float>> memory_limit_mb = {{2500,2500}};
+  const std::vector<std::vector<float>> memory_limit_mb;
   for (const auto& v : memory_limit_mb) {
     auto virtual_devices =
         session_options->config.mutable_gpu_options()
