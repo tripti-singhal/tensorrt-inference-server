@@ -67,7 +67,9 @@ void
 BuildBackendConfigMap(
     const std::string& version, const std::string& model_store_path,
     const bool strict_model_config, const float tf_gpu_memory_fraction,
-    const bool tf_allow_soft_placement, BackendConfigMap* backend_configs)
+    const bool tf_allow_soft_placement,
+    const std::vector<std::vector<float>> tf_vgpu_memory_limit_mb,
+    BackendConfigMap* backend_configs)
 {
 #ifdef TRTIS_ENABLE_TENSORFLOW
   //// Tensorflow GraphDef and SavedModel
@@ -80,6 +82,11 @@ BuildBackendConfigMap(
     } else {
       graphdef_config->allow_gpu_memory_growth = false;
       graphdef_config->per_process_gpu_memory_fraction = tf_gpu_memory_fraction;
+    }
+
+    if (!tf_vgpu_memory_limit_mb.empty()) {
+      graphdef_config->memory_limit_mb = tf_vgpu_memory_limit_mb;
+      graphdef_config->per_process_gpu_memory_fraction = 0.0;
     }
 
     graphdef_config->allow_soft_placement = tf_allow_soft_placement;
@@ -777,6 +784,7 @@ ModelRepositoryManager::Create(
     const std::shared_ptr<ServerStatusManager>& status_manager,
     const std::string& repository_path, const bool strict_model_config,
     const float tf_gpu_memory_fraction, const bool tf_allow_soft_placement,
+    const std::vector<std::vector<float>> tf_memory_limit_mb,
     const uint32_t repository_poll_secs, const bool polling_enabled,
     std::unique_ptr<ModelRepositoryManager>* model_repository_manager)
 {
@@ -793,7 +801,8 @@ ModelRepositoryManager::Create(
 
   BuildBackendConfigMap(
       server_version, repository_path, strict_model_config,
-      tf_gpu_memory_fraction, tf_allow_soft_placement, &backend_config_map);
+      tf_gpu_memory_fraction, tf_allow_soft_placement, tf_memory_limit_mb,
+      &backend_config_map);
 
   std::unique_ptr<BackendLifeCycle> life_cycle;
   RETURN_IF_ERROR(BackendLifeCycle::Create(
