@@ -33,6 +33,7 @@
 #include <thread>
 #include "src/core/backend.h"
 #include "src/core/constants.h"
+#include "src/core/ensemble_utils.h"
 #include "src/core/filesystem.h"
 #include "src/core/logging.h"
 #include "src/core/model_config_utils.h"
@@ -242,7 +243,8 @@ class ModelRepositoryManager::BackendLifeCycle {
   // be unloaded before loading the specified versions.
   Status AsyncLoad(
       const std::string& model_name, const std::vector<int64_t>& versions,
-      const ModelConfig& model_config, bool force_unload = true);
+      const ModelConfig& model_config, bool force_unload = true,
+      std::function<void()> OnComplete = nullptr);
 
   // Get specified model version's backend. Latest ready version will
   // be retrieved if 'version' is -1. Return error if the version specified is
@@ -516,7 +518,8 @@ ModelRepositoryManager::BackendLifeCycle::GetInferenceBackend(
 Status
 ModelRepositoryManager::BackendLifeCycle::AsyncLoad(
     const std::string& model_name, const std::vector<int64_t>& versions,
-    const ModelConfig& model_config, bool force_unload)
+    const ModelConfig& model_config, bool force_unload,
+    std::function<void()> OnComplete)
 {
   LOG_VERBOSE(1) << "AsyncLoad() '" << model_name << "'";
   std::lock_guard<std::mutex> map_lock(map_mtx_);
@@ -529,7 +532,8 @@ ModelRepositoryManager::BackendLifeCycle::AsyncLoad(
     for (auto& version_backend : it->second) {
       std::lock_guard<std::recursive_mutex> lock(version_backend.second->mtx_);
       version_backend.second->next_action_ = ActionType::UNLOAD;
-      TriggerNextAction(model_name, version_backend.first, version_backend.second.get());
+      TriggerNextAction(
+          model_name, version_backend.first, version_backend.second.get());
     }
   }
 
@@ -819,20 +823,14 @@ ModelRepositoryManager::Create(
         "Unexpected initial state for model repository");
   }
 
-  Status status = Status::Success;
-  for (const auto& name : added) {
-    // If there is error on model loading, just report it and move to next model
-    Status update_status = local_manager->Update(name, true);
-    if (!update_status.IsOk()) {
-      LOG_ERROR << "failed to load model '" << name
-                << "': " << update_status.Message();
-      status = update_status;
-    }
-  }
+  RETURN_IF_ERROR(local_manager->Update(added, deleted, modified));
+
+  // model loading / unloading error will be printed but ignored
+  local_manager->LoadModelByDependency();
 
   *model_repository_manager = std::move(local_manager);
 
-  return status;
+  return Status::Success;
 }
 
 Status
@@ -848,24 +846,7 @@ ModelRepositoryManager::PollAndUpdate()
     return Status::Success;
   }
 
-  // Added models should be loaded
-  for (const auto& name : added) {
-    Status status = Update(name, true);
-    if (!status.IsOk()) {
-      LOG_ERROR << "failed to load model '" << name
-                << "': " << status.Message();
-    }
-  }
-
-  // If there are any modified model, (re)load them to pick up
-  // the changes.
-  for (const auto& name : modified) {
-    Status status = Update(name, false);
-    if (!status.IsOk()) {
-      LOG_ERROR << "failed to reload model '" << name
-                << "': " << status.Message();
-    }
-  }
+  Update(added, deleted, modified);
 
   for (const auto& name : deleted) {
     ModelConfig model_config;
@@ -874,26 +855,67 @@ ModelRepositoryManager::PollAndUpdate()
     backend_life_cycle_->AsyncLoad(name, versions, model_config);
   }
 
+  // model loading / unloading error will be printed but ignored
+  LoadModelByDependency();
+
   return Status::Success;
 }
 
 Status
-ModelRepositoryManager::Update(const std::string& model_name, bool is_added)
+ModelRepositoryManager::Update(
+    const std::set<std::string>& added, const std::set<std::string>& deleted,
+    const std::set<std::string>& modified)
 {
-  ModelConfig model_config;
-  std::vector<int64_t> versions;
-  RETURN_IF_ERROR(GetModelConfig(model_name, &model_config));
+  RETURN_IF_ERROR(UpdateDependencyGraph(this, added, deleted, modified, &dependency_graph_, &missing_nodes_));
+  
   // Added model should be initialized for status reporting. Otherwise,
   // we want to keep the current status information so don't re-init it.
-  if (is_added) {
+  for (const auto& model_name : added) {
+    const auto& model_config = dependency_graph_.find(model_name)->second->model_config_;
     RETURN_IF_ERROR(status_manager_->InitForModel(model_name, model_config));
-  } else {
+  }
+  for (const auto& model_name : modified) {
+    const auto& model_config = dependency_graph_.find(model_name)->second->model_config_;
     RETURN_IF_ERROR(
         status_manager_->UpdateConfigForModel(model_name, model_config));
   }
-  RETURN_IF_ERROR(VersionsToLoad(model_name, model_config, versions));
-  RETURN_IF_ERROR(
-      backend_life_cycle_->AsyncLoad(model_name, versions, model_config));
+
+  return Status::Success;
+}
+
+Status
+ModelRepositoryManager::LoadModelByDependency()
+{
+  std::unordered_map<std::string, std::set<int64_t>> loaded_models;
+  auto set_pair = ModelsToLoad(loaded_models, &dependency_graph_);
+  // Loop until all model are loaded / unloaded
+  while ((!set_pair.first.empty()) && (!set_pair.second.empty())) {
+    // Unload invalid models first
+    for (const auto& invalid_model : set_pair.second) {
+      ModelConfig model_config;
+      std::vector<int64_t> versions;
+      // Utilize "force_unload" of AsyncLoad()
+      backend_life_cycle_->AsyncLoad(invalid_model, versions, model_config);
+    }
+    // load valid models and wait for load results
+    for (const auto& valid_model : set_pair.first) {
+      // [TODO] Shouldn't return on error, things have changed
+      auto node = dependency_graph_.find(valid_model)->second.get();
+      std::vector<int64_t> versions;
+      Status status;
+      status = VersionsToLoad(valid_model, node->model_config_, versions);
+      // [TODO] needs some form of callback and cv
+      // so that the manager will wait until current stage is finished
+      if (status.IsOk()) {
+        status = backend_life_cycle_->AsyncLoad(valid_model, versions, node->model_config_);
+      }
+      if (!status.IsOk()) {
+        LOG_ERROR << "failed to load model '" << valid_model
+                  << "': " << status.Message();
+        node->status_ = status;
+      }
+    } 
+  }
   return Status::Success;
 }
 

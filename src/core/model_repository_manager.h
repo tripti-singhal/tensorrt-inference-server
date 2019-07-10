@@ -34,6 +34,7 @@
 
 namespace nvidia { namespace inferenceserver {
 
+struct DependencyNode;
 class InferenceServer;
 class InferenceBackend;
 class ServerStatusManager;
@@ -152,11 +153,17 @@ class ModelRepositoryManager {
       std::set<std::string>* added, std::set<std::string>* deleted,
       std::set<std::string>* modified, std::set<std::string>* unmodified);
 
-  /// Update the configuration of newly added / modified model and serve
+  /// [TODO] better naming
+  /// Update the configurations of newly added / modified model and serve
   /// the model based on its version policy.
   /// \param model_name The name of the model to be updated.
   /// \param is_added If the model is being added to the model repository.
-  Status Update(const std::string& model_name, bool is_added);
+  Status Update(
+      const std::set<std::string>& added, const std::set<std::string>& deleted,
+      const std::set<std::string>& modified);
+
+  /// [TODO] docs
+  Status LoadModelByDependency();
 
   /// Get the list of versions to be loaded for a named model based on version
   /// policy.
@@ -176,6 +183,9 @@ class ModelRepositoryManager {
   std::mutex poll_mu_;
   std::mutex infos_mu_;
   ModelInfoMap infos_;
+
+  std::unordered_map<std::string, std::unique_ptr<DependencyNode>> dependency_graph_;
+  std::unordered_map<std::string, std::unique_ptr<DependencyNode>> missing_nodes_;
 
   std::shared_ptr<ServerStatusManager> status_manager_;
 
