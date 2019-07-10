@@ -37,7 +37,8 @@ namespace nvidia { namespace inferenceserver {
 /// A basic unit in ensemble graph that records the data type and shape
 /// of the ensemble tensor and which model they are inferred from.
 struct TensorNode {
-  TensorNode(const std::string& model_name, const DataType& type, const DimsList& dims)
+  TensorNode(
+      const std::string& model_name, const DataType& type, const DimsList& dims)
       : model_name_(model_name), type_(type), dims_(dims), ready_(false)
   {
   }
@@ -50,7 +51,8 @@ struct TensorNode {
   std::vector<TensorNode*> next_nodes_;
 };
 
-/// A basic unit in dependency graph that records the models seen by the model repository manager.
+/// A basic unit in dependency graph that records the models seen by the model
+/// repository manager.
 struct DependencyNode {
   DependencyNode(const std::string& model_name)
       : model_name_(model_name), status_(Status::Success), checked_(false)
@@ -61,8 +63,9 @@ struct DependencyNode {
   Status status_;
   bool checked_;
   ModelConfig model_config_;
+  std::set<int64_t> loaded_versions_;
   std::set<DependencyNode*> missing_upstream_nodes_;
-  std::set<DependencyNode*> upstream_nodes_;
+  std::unordered_map<DependencyNode*, int64_t> upstream_nodes_;
   std::set<DependencyNode*> downstream_nodes_;
 };
 
@@ -78,13 +81,13 @@ Status ValidateTensorConsistency(
     const TensorNode& lhs, const TensorNode& rhs, const std::string& message);
 
 /// [TODO] add / update all docs
-Status
-UpdateDependencyGraph(
-    ModelRepositoryManager* manager,
-    const std::set<std::string>& added, const std::set<std::string>& deleted,
-    const std::set<std::string>& modified,
-    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* dependency_graph,
-    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* missing_nodes);
+Status UpdateDependencyGraph(
+    ModelRepositoryManager* manager, const std::set<std::string>& added,
+    const std::set<std::string>& deleted, const std::set<std::string>& modified,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>*
+        dependency_graph,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>*
+        missing_nodes);
 
 /// Validate that the ensembles are specified correctly. Assuming that the
 /// inputs and outputs specified in all model configurations are accurate.
@@ -96,8 +99,10 @@ UpdateDependencyGraph(
 Status ValidateEnsembleConfig(
     const std::set<DependencyNode*>& updated_nodes,
     const std::set<DependencyNode*>& affected_nodes,
-    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* dependency_graph,
-    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* missing_nodes);
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>*
+        dependency_graph,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>*
+        missing_nodes);
 
 /// Validate that the ensembles are specified correctly. Assuming that the
 /// inputs and outputs specified in all model configurations are accurate.
@@ -117,7 +122,14 @@ Status ValidateEnsembleConfig(
     const std::string& ensemble,
     std::unordered_map<std::string, bool>* ensembles,
     std::deque<std::string>* ensemble_dependency,
-    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* dependency_graph,
-    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* missing_nodes);
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>*
+        dependency_graph,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>*
+        missing_nodes);
+
+std::pair<std::set<std::string>, std::set<std::string>> ModelsToLoad(
+    std::unordered_map<std::string, std::set<int64_t>> loaded_models,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>*
+        dependency_graph);
 
 }}  // namespace nvidia::inferenceserver

@@ -36,7 +36,8 @@ namespace nvidia { namespace inferenceserver {
 namespace {
 
 // [TODO] rethink different flags
-void UpdateDownstreamState(
+void
+UpdateDownstreamState(
     std::set<DependencyNode*>* start_nodes,
     std::set<DependencyNode*>* updated_nodes)
 {
@@ -49,7 +50,8 @@ void UpdateDownstreamState(
 }
 
 // [TODO] verify what has been checked in ValidateModelConfig()
-Status ValidateTensorMapping(
+Status
+ValidateTensorMapping(
     const std::string& ensemble, const ModelEnsembling::Step& step,
     const ModelConfig& model_config,
     std::unordered_map<std::string, TensorNode>* ensemble_tensors)
@@ -63,9 +65,9 @@ Status ValidateTensorMapping(
     if (input_names.find(input_map.first) == input_names.end()) {
       return Status(
           RequestStatusCode::INVALID_ARG,
-          "in ensemble " + ensemble + ", ensemble tensor " +
-              input_map.second + " is mapping to non-existing input " +
-              input_map.first + " in model " + step.model_name());
+          "in ensemble " + ensemble + ", ensemble tensor " + input_map.second +
+              " is mapping to non-existing input " + input_map.first +
+              " in model " + step.model_name());
     }
   }
   for (const auto& model_input : model_config.input()) {
@@ -112,9 +114,9 @@ Status ValidateTensorMapping(
     if (output_names.find(output_map.first) == output_names.end()) {
       return Status(
           RequestStatusCode::INVALID_ARG,
-          "in ensemble " + ensemble + ", ensemble tensor " +
-              output_map.second + " is mapped from non-existing output " +
-              output_map.first + " in model " + step.model_name());
+          "in ensemble " + ensemble + ", ensemble tensor " + output_map.second +
+              " is mapped from non-existing output " + output_map.first +
+              " in model " + step.model_name());
     }
   }
   for (const auto& output_map : step.output_map()) {
@@ -140,8 +142,8 @@ Status ValidateTensorMapping(
       return Status(
           RequestStatusCode::INVALID_ARG,
           "in ensemble " + ensemble + ", multiple outputs in model " +
-              model_config.name() +
-              " are mapped to the same ensemble tensor " + output_map.second);
+              model_config.name() + " are mapped to the same ensemble tensor " +
+              output_map.second);
     }
   }
 
@@ -157,7 +159,7 @@ Status ValidateTensorMapping(
   return Status::Success;
 }
 
-} // namespace
+}  // namespace
 
 Status
 ValidateTensorConsistency(
@@ -199,12 +201,15 @@ ValidateEnsembleConfig(
     const std::string& ensemble,
     std::unordered_map<std::string, bool>* ensembles,
     std::deque<std::string>* ensemble_dependency,
-    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* dependency_graph,
-    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* missing_nodes)
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>*
+        dependency_graph,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>*
+        missing_nodes)
 {
   std::unordered_map<std::string, TensorNode> ensemble_tensors;
 
-  const auto& ensemble_config = dependency_graph->find(ensemble)->second->model_config_;
+  const auto& ensemble_config =
+      dependency_graph->find(ensemble)->second->model_config_;
 
   for (const auto& input : ensemble_config.input()) {
     TensorNode input_node(ensemble, input.data_type(), input.dims());
@@ -230,26 +235,28 @@ ValidateEnsembleConfig(
         mit = missing_nodes->emplace(model_name, std::move(node)).first;
       }
       mit->second->downstream_nodes_.emplace(ensemble_node);
-      ensemble_node->upstream_nodes_.emplace(mit->second.get());
+      ensemble_node->upstream_nodes_.emplace(
+          mit->second.get(), step.model_version());
       ensemble_node->status_ = Status(
           RequestStatusCode::INVALID_ARG,
           "ensemble " + ensemble + " contains model " + model_name +
-          " which is not in the available models");
+              " which is not in the available models");
       // continue to complete the edges of the graph
       continue;
     } else {
       dit->second->downstream_nodes_.emplace(ensemble_node);
-      ensemble_node->upstream_nodes_.emplace(dit->second.get());
+      ensemble_node->upstream_nodes_.emplace(
+          dit->second.get(), step.model_version());
     }
   }
-  
+
   if (ensemble_node->status_.IsOk()) {
     for (const auto& step : ensemble_config.ensemble_scheduling().step()) {
       const auto& model_name = step.model_name();
       ModelConfig model_config;
       for (auto& node : ensemble_node->upstream_nodes_) {
-        if (model_name == node->model_name_) {
-          model_config = node->model_config_;
+        if (model_name == node.first->model_name_) {
+          model_config = node.first->model_config_;
           break;
         }
       }
@@ -276,27 +283,29 @@ ValidateEnsembleConfig(
         if (found) {
           ensemble_node->status_ = Status(
               RequestStatusCode::INVALID_ARG,
-              "circular dependency between ensembles: " + model_name + " -> ... -> " +
-                  ensemble + " -> " + model_name);
+              "circular dependency between ensembles: " + model_name +
+                  " -> ... -> " + ensemble + " -> " + model_name);
           break;
         }
 
         if ((ensembles->find(model_name))->second == false) {
           ensemble_dependency->push_back(ensemble);
           Status status = ValidateEnsembleConfig(
-              model_name, ensembles, ensemble_dependency, dependency_graph, missing_nodes);
+              model_name, ensembles, ensemble_dependency, dependency_graph,
+              missing_nodes);
           ensemble_dependency->pop_back();
           if (!status.IsOk()) {
             ensemble_node->status_ = Status(
                 RequestStatusCode::INVALID_ARG,
-                "ensemble " + ensemble + " depends on " + model_name
-                     + " which contains invalid model config");
+                "ensemble " + ensemble + " depends on " + model_name +
+                    " which contains invalid model config");
             break;
           }
         }
       }
 
-      ensemble_node->status_ = ValidateTensorMapping(ensemble, step, model_config, &ensemble_tensors);
+      ensemble_node->status_ = ValidateTensorMapping(
+          ensemble, step, model_config, &ensemble_tensors);
       if (!ensemble_node->status_.IsOk()) {
         break;
       }
@@ -309,17 +318,20 @@ ValidateEnsembleConfig(
 
 Status
 UpdateDependencyGraph(
-    ModelRepositoryManager* manager,
-    const std::set<std::string>& added, const std::set<std::string>& deleted,
-    const std::set<std::string>& modified,
-    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* dependency_graph,
-    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* missing_nodes)
+    ModelRepositoryManager* manager, const std::set<std::string>& added,
+    const std::set<std::string>& deleted, const std::set<std::string>& modified,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>*
+        dependency_graph,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>*
+        missing_nodes)
 {
   // update dependency graph
-  // keep track of dependents as changes are going to affect downstream instead of upstream
-  
-  // deleted, drop from dependency_graph, add to missing_nodes if downstreams is not empty
-  // affected_nodes are all ensembles as only ensembles are depending on other models
+  // keep track of dependents as changes are going to affect downstream instead
+  // of upstream
+
+  // deleted, drop from dependency_graph, add to missing_nodes if downstreams is
+  // not empty affected_nodes are all ensembles as only ensembles are depending
+  // on other models
   std::set<DependencyNode*> affected_nodes;
   std::set<DependencyNode*> updated_nodes;
   for (const auto& model_name : deleted) {
@@ -334,7 +346,7 @@ UpdateDependencyGraph(
 
         // remove this node from its upstream node
         for (auto& upstream : it->second->upstream_nodes_) {
-          upstream->downstream_nodes_.erase(it->second.get());
+          upstream.first->downstream_nodes_.erase(it->second.get());
         }
         it->second->upstream_nodes_.clear();
 
@@ -352,12 +364,18 @@ UpdateDependencyGraph(
     if (it != dependency_graph->end()) {
       UpdateDownstreamState(&it->second->downstream_nodes_, &affected_nodes);
       manager->GetModelConfig(model_name, &it->second->model_config_);
+      // remove this node from its upstream node
+      for (auto& upstream : it->second->upstream_nodes_) {
+        upstream.first->downstream_nodes_.erase(it->second.get());
+      }
+      it->second->upstream_nodes_.clear();
       it->second->checked_ = false;
       updated_nodes.emplace(it->second.get());
     }
   }
 
-  // added, add to dependency_graph, if in missing_node, invalidate (uncheck) and associate all downstreams, remove from missing_node
+  // added, add to dependency_graph, if in missing_node, invalidate (uncheck)
+  // and associate all downstreams, remove from missing_node
   for (const auto& model_name : added) {
     std::unique_ptr<DependencyNode> added_node;
     auto it = missing_nodes->find(model_name);
@@ -382,7 +400,8 @@ UpdateDependencyGraph(
   }
 
   // [TODO] collect modified configs and ValidateEnsembleConfig() here
-  ValidateEnsembleConfig(updated_nodes, affected_nodes, dependency_graph, missing_nodes);
+  ValidateEnsembleConfig(
+      updated_nodes, affected_nodes, dependency_graph, missing_nodes);
   // [TODO] return <valid, invalid> pair?
   return Status::Success;
 }
@@ -391,8 +410,10 @@ Status
 ValidateEnsembleConfig(
     const std::set<DependencyNode*>& updated_nodes,
     const std::set<DependencyNode*>& affected_nodes,
-    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* dependency_graph,
-    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* missing_nodes)
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>*
+        dependency_graph,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>*
+        missing_nodes)
 {
   std::unordered_map<std::string, bool> ensembles;
 
@@ -417,10 +438,116 @@ ValidateEnsembleConfig(
       continue;
     }
     RETURN_IF_ERROR(ValidateEnsembleConfig(
-        pair.first, &ensembles, &ensemble_dependency, dependency_graph, missing_nodes));
+        pair.first, &ensembles, &ensemble_dependency, dependency_graph,
+        missing_nodes));
   }
 
   return Status::Success;
+}
+
+std::pair<std::set<std::string>, std::set<std::string>>
+ModelsToLoad(
+    std::unordered_map<std::string, std::set<int64_t>> loaded_models,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>*
+        dependency_graph)
+{
+  std::pair<std::set<std::string>, std::set<std::string>> res;
+  // first call to this function
+  if (loaded_models.empty()) {
+    for (auto& pair : (*dependency_graph)) {
+      auto& node = pair.second;
+      // only care about nodes that are affected by the update
+      if (!node->checked_) {
+        // the node failed on validation
+        if (!node->status_.IsOk()) {
+          res.second.emplace(node->model_name_);
+        } else {
+          bool node_ready = true;
+          bool node_valid = true;
+          for (auto& upstream : node->upstream_nodes_) {
+            if (!upstream.first->checked_) {
+              node_ready = false;
+              break;
+            }
+            if (!upstream.first->status_.IsOk()) {
+              node_valid = false;
+              break;
+            }
+            // check if the required version of upstream is loaded
+            if (upstream.first->loaded_versions_.empty()) {
+              node_valid = false;
+              break;
+            } else if (upstream.second != -1) {
+              auto it = upstream.first->loaded_versions_.find(upstream.second);
+              if (it == upstream.first->loaded_versions_.end()) {
+                node_valid = false;
+                break;
+              }
+            }
+          }
+          if (node_ready) {
+            if (node_valid) {
+              res.first.emplace(node->model_name_);
+            } else {
+              res.second.emplace(node->model_name_);
+            }
+          }
+        }
+      }
+    }
+  } else {
+    // check downstream of the loaded model is sufficient
+    for (const auto& model : loaded_models) {
+      // [TODO] return DependencyNode directly? maybe after DependencyGraph is
+      // included in ModelRepositoryManager
+      auto it = dependency_graph->find(model.first);
+      // update loaded version
+      it->second->loaded_versions_ = model.second;
+      it->second->checked_ = true;
+      for (auto& node : it->second->downstream_nodes_) {
+        // only care about nodes that are affected by the update
+        if (!node->checked_) {
+          // the node failed on validation
+          if (!node->status_.IsOk()) {
+            res.second.emplace(node->model_name_);
+          } else {
+            bool node_ready = true;
+            bool node_valid = true;
+            for (auto& upstream : node->upstream_nodes_) {
+              if (!upstream.first->checked_) {
+                node_ready = false;
+                break;
+              }
+              if (!upstream.first->status_.IsOk()) {
+                node_valid = false;
+                break;
+              }
+              // check if the required version of upstream is loaded
+              if (upstream.first->loaded_versions_.empty()) {
+                node_valid = false;
+                break;
+              } else if (upstream.second != -1) {
+                auto it =
+                    upstream.first->loaded_versions_.find(upstream.second);
+                if (it == upstream.first->loaded_versions_.end()) {
+                  node_valid = false;
+                  break;
+                }
+              }
+            }
+            if (node_ready) {
+              if (node_valid) {
+                res.first.emplace(node->model_name_);
+              } else {
+                res.second.emplace(node->model_name_);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return res;
 }
 
 }}  // namespace nvidia::inferenceserver
