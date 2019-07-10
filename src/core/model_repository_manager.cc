@@ -573,6 +573,8 @@ ModelRepositoryManager::BackendLifeCycle::TriggerNextAction(
       RETURN_IF_ERROR(Unload(model_name, version, backend_info));
       break;
     default:
+      // [TODO] Any change on the model version is completed, trigger
+      // OnComplete call back if any
       break;
   }
 

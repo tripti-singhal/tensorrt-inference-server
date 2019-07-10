@@ -33,23 +33,149 @@
 
 namespace nvidia { namespace inferenceserver {
 
+namespace {
+
+// [TODO] rethink different flags
+void UpdateDownstreamState(
+    std::set<DependencyNode*>* start_nodes,
+    std::set<DependencyNode*>* updated_nodes)
+{
+  // Mark downstream nodes as unchecked recursively
+  for (auto& dependent : *start_nodes) {
+    dependent->checked_ = false;
+    UpdateDownstreamState(&dependent->downstream_nodes_, updated_nodes);
+    updated_nodes->emplace(dependent);
+  }
+}
+
+// [TODO] verify what has been checked in ValidateModelConfig()
+Status ValidateTensorMapping(
+    const std::string& ensemble, const ModelEnsembling::Step& step,
+    const ModelConfig& model_config,
+    std::unordered_map<std::string, TensorNode>* ensemble_tensors)
+{
+  // Check all inputs are mapped and no mapping to invalid inputs
+  std::set<std::string> input_names;
+  for (const auto& model_input : model_config.input()) {
+    input_names.insert(model_input.name());
+  }
+  for (const auto& input_map : step.input_map()) {
+    if (input_names.find(input_map.first) == input_names.end()) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "in ensemble " + ensemble + ", ensemble tensor " +
+              input_map.second + " is mapping to non-existing input " +
+              input_map.first + " in model " + step.model_name());
+    }
+  }
+  for (const auto& model_input : model_config.input()) {
+    size_t mapped_cnt = 0;
+    for (const auto& input_map : step.input_map()) {
+      if (model_input.name() == input_map.first) {
+        TensorNode model_tensor(
+            step.model_name(), model_input.data_type(), model_input.dims());
+        auto it = ensemble_tensors->find(input_map.second);
+        if (it != ensemble_tensors->end()) {
+          RETURN_IF_ERROR(ValidateTensorConsistency(
+              it->second, model_tensor,
+              "in ensemble " + ensemble + ", ensemble tensor " +
+                  input_map.second + ": "));
+        } else {
+          ensemble_tensors->emplace(
+              std::make_pair(input_map.second, model_tensor));
+        }
+        mapped_cnt++;
+      }
+    }
+    if (mapped_cnt == 0) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "in ensemble " + ensemble + ", input " + model_input.name() +
+              " in model " + model_config.name() +
+              " is not mapped to any ensemble tensors");
+    } else if (mapped_cnt > 1) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "in ensemble " + ensemble + ", input " + model_input.name() +
+              " in model " + model_config.name() +
+              " is mapped to multiple ensemble tensors");
+    }
+  }
+
+  // Check no multiple mappings to same ensemble tensor
+  // and no mapping from invalid outputs
+  std::set<std::string> output_names;
+  for (const auto& model_output : model_config.output()) {
+    output_names.insert(model_output.name());
+  }
+  for (const auto& output_map : step.output_map()) {
+    if (output_names.find(output_map.first) == output_names.end()) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "in ensemble " + ensemble + ", ensemble tensor " +
+              output_map.second + " is mapped from non-existing output " +
+              output_map.first + " in model " + step.model_name());
+    }
+  }
+  for (const auto& output_map : step.output_map()) {
+    size_t mapped_cnt = 0;
+    for (const auto& model_output : model_config.output()) {
+      if (model_output.name() == output_map.first) {
+        TensorNode model_tensor(
+            step.model_name(), model_output.data_type(), model_output.dims());
+        auto it = ensemble_tensors->find(output_map.second);
+        if (it != ensemble_tensors->end()) {
+          RETURN_IF_ERROR(ValidateTensorConsistency(
+              it->second, model_tensor,
+              "in ensemble " + ensemble + ", ensemble tensor " +
+                  output_map.second + ": "));
+        } else {
+          ensemble_tensors->emplace(
+              std::make_pair(output_map.second, model_tensor));
+        }
+        mapped_cnt++;
+      }
+    }
+    if (mapped_cnt > 1) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "in ensemble " + ensemble + ", multiple outputs in model " +
+              model_config.name() +
+              " are mapped to the same ensemble tensor " + output_map.second);
+    }
+  }
+
+  // link ensemble tensors
+  for (const auto& output_map : step.output_map()) {
+    auto& node = ensemble_tensors->find(output_map.second)->second;
+    for (const auto& input_map : step.input_map()) {
+      auto& prev_node = ensemble_tensors->find(input_map.second)->second;
+      node.prev_nodes_.push_back(&prev_node);
+      prev_node.next_nodes_.push_back(&node);
+    }
+  }
+  return Status::Success;
+}
+
+} // namespace
+
 Status
 ValidateTensorConsistency(
     const TensorNode& lhs, const TensorNode& rhs, const std::string& message)
 {
-  if (lhs.type != rhs.type) {
+  if (lhs.type_ != rhs.type_) {
     return Status(
         RequestStatusCode::INVALID_ARG,
-        message + "inconsistent data type: " + std::to_string(lhs.type) +
-            " is inferred from model " + lhs.model_name + " while " +
-            std::to_string(rhs.type) + " is inferred from model " +
-            rhs.model_name);
+        message + "inconsistent data type: " + std::to_string(lhs.type_) +
+            " is inferred from model " + lhs.model_name_ + " while " +
+            std::to_string(rhs.type_) + " is inferred from model " +
+            rhs.model_name_);
   }
 
-  bool consistent = (lhs.dims.size() == rhs.dims.size());
+  bool consistent = (lhs.dims_.size() == rhs.dims_.size());
   if (consistent) {
-    for (int i = 0; i < lhs.dims.size(); i++) {
-      if (lhs.dims[i] != rhs.dims[i]) {
+    for (int i = 0; i < lhs.dims_.size(); i++) {
+      if (lhs.dims_[i] != rhs.dims_[i]) {
         consistent = false;
         break;
       }
@@ -58,26 +184,27 @@ ValidateTensorConsistency(
   if (!consistent) {
     return Status(
         RequestStatusCode::INVALID_ARG,
-        message + "inconsistent shape: " + DimsListToString(lhs.dims) +
-            " is inferred from model " + lhs.model_name + " while " +
-            DimsListToString(rhs.dims) + " is inferred from model " +
-            rhs.model_name);
+        message + "inconsistent shape: " + DimsListToString(lhs.dims_) +
+            " is inferred from model " + lhs.model_name_ + " while " +
+            DimsListToString(rhs.dims_) + " is inferred from model " +
+            rhs.model_name_);
   }
 
   return Status::Success;
 }
 
+// [TODO] break this up
 Status
 ValidateEnsembleConfig(
     const std::string& ensemble,
-    const std::unordered_map<std::string, ModelConfig>& config_map,
-    const std::unordered_map<std::string, std::string>& invalid_model_names,
-    std::unordered_map<std::string, bool>& ensembles,
-    std::deque<std::string>& ensemble_dependency)
+    std::unordered_map<std::string, bool>* ensembles,
+    std::deque<std::string>* ensemble_dependency,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* dependency_graph,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* missing_nodes)
 {
   std::unordered_map<std::string, TensorNode> ensemble_tensors;
 
-  const auto& ensemble_config = config_map.at(ensemble);
+  const auto& ensemble_config = dependency_graph->find(ensemble)->second->model_config_;
 
   for (const auto& input : ensemble_config.input()) {
     TensorNode input_node(ensemble, input.data_type(), input.dims());
@@ -88,233 +215,200 @@ ValidateEnsembleConfig(
     ensemble_tensors.emplace(std::make_pair(output.name(), output_node));
   }
 
+  auto ensemble_node = dependency_graph->find(ensemble)->second.get();
+  // [TODO] only updated ensembles? No, still need to check upstream anyway
+  // check model config again
+  ensemble_node->upstream_nodes_.clear();
   for (const auto& step : ensemble_config.ensemble_scheduling().step()) {
     const auto& model_name = step.model_name();
-    if (invalid_model_names.find(model_name) != invalid_model_names.end()) {
-      return Status(
-          RequestStatusCode::INVALID_ARG,
-          "ensemble " + ensemble + " contains invalid model " + model_name +
-              " : " + invalid_model_names.at(model_name));
-    }
-    auto it = config_map.find(model_name);
-    if (it == config_map.end()) {
-      return Status(
+    auto dit = dependency_graph->find(model_name);
+    if (dit == dependency_graph->end()) {
+      auto mit = missing_nodes->find(model_name);
+      if (mit == missing_nodes->end()) {
+        std::unique_ptr<DependencyNode> node(new DependencyNode(model_name));
+        ensemble_node->missing_upstream_nodes_.emplace(node.get());
+        mit = missing_nodes->emplace(model_name, std::move(node)).first;
+      }
+      mit->second->downstream_nodes_.emplace(ensemble_node);
+      ensemble_node->upstream_nodes_.emplace(mit->second.get());
+      ensemble_node->status_ = Status(
           RequestStatusCode::INVALID_ARG,
           "ensemble " + ensemble + " contains model " + model_name +
-              " which is not in the available models");
-    }
-    const auto& model_config = it->second;
-    if (model_config.max_batch_size() < ensemble_config.max_batch_size()) {
-      return Status(
-          RequestStatusCode::INVALID_ARG,
-          "ensemble " + ensemble + " allows maximum batch size " +
-              std::to_string(ensemble_config.max_batch_size()) +
-              ", but it contains model " + model_name +
-              " which only allows  maximum batch size to be " +
-              std::to_string(model_config.max_batch_size()));
-    }
-
-    if (model_config.has_ensemble_scheduling()) {
-      for (const auto& name : ensemble_dependency) {
-        if (name == model_name) {
-          return Status(
-              RequestStatusCode::INVALID_ARG,
-              "circular dependency between ensembles: " + name + " -> ... -> " +
-                  ensemble + " -> " + name);
-        }
-      }
-
-      if ((ensembles.find(model_name))->second == false) {
-        ensemble_dependency.push_back(ensemble);
-        RETURN_IF_ERROR(ValidateEnsembleConfig(
-            model_name, config_map, invalid_model_names, ensembles,
-            ensemble_dependency));
-        ensemble_dependency.pop_back();
-      }
-    }
-
-    // Check all inputs are mapped and no mapping to invalid inputs
-    std::set<std::string> input_names;
-    for (const auto& model_input : model_config.input()) {
-      input_names.insert(model_input.name());
-    }
-    for (const auto& input_map : step.input_map()) {
-      if (input_names.find(input_map.first) == input_names.end()) {
-        return Status(
-            RequestStatusCode::INVALID_ARG,
-            "in ensemble " + ensemble + ", ensemble tensor " +
-                input_map.second + " is mapping to non-existing input " +
-                input_map.first + " in model " + step.model_name());
-      }
-    }
-    for (const auto& model_input : model_config.input()) {
-      size_t mapped_cnt = 0;
-      for (const auto& input_map : step.input_map()) {
-        if (model_input.name() == input_map.first) {
-          TensorNode model_tensor(
-              step.model_name(), model_input.data_type(), model_input.dims());
-          auto it = ensemble_tensors.find(input_map.second);
-          if (it != ensemble_tensors.end()) {
-            RETURN_IF_ERROR(ValidateTensorConsistency(
-                it->second, model_tensor,
-                "in ensemble " + ensemble + ", ensemble tensor " +
-                    input_map.second + ": "));
-          } else {
-            ensemble_tensors.emplace(
-                std::make_pair(input_map.second, model_tensor));
-          }
-          mapped_cnt++;
-        }
-      }
-      if (mapped_cnt == 0) {
-        return Status(
-            RequestStatusCode::INVALID_ARG,
-            "in ensemble " + ensemble + ", input " + model_input.name() +
-                " in model " + model_config.name() +
-                " is not mapped to any ensemble tensors");
-      } else if (mapped_cnt > 1) {
-        return Status(
-            RequestStatusCode::INVALID_ARG,
-            "in ensemble " + ensemble + ", input " + model_input.name() +
-                " in model " + model_config.name() +
-                " is mapped to multiple ensemble tensors");
-      }
-    }
-
-    // Check no multiple mappings to same ensemble tensor
-    // and no mapping from invalid outputs
-    std::set<std::string> output_names;
-    for (const auto& model_output : model_config.output()) {
-      output_names.insert(model_output.name());
-    }
-    for (const auto& output_map : step.output_map()) {
-      if (output_names.find(output_map.first) == output_names.end()) {
-        return Status(
-            RequestStatusCode::INVALID_ARG,
-            "in ensemble " + ensemble + ", ensemble tensor " +
-                output_map.second + " is mapped from non-existing output " +
-                output_map.first + " in model " + step.model_name());
-      }
-    }
-    for (const auto& output_map : step.output_map()) {
-      size_t mapped_cnt = 0;
-      for (const auto& model_output : model_config.output()) {
-        if (model_output.name() == output_map.first) {
-          TensorNode model_tensor(
-              step.model_name(), model_output.data_type(), model_output.dims());
-          auto it = ensemble_tensors.find(output_map.second);
-          if (it != ensemble_tensors.end()) {
-            RETURN_IF_ERROR(ValidateTensorConsistency(
-                it->second, model_tensor,
-                "in ensemble " + ensemble + ", ensemble tensor " +
-                    output_map.second + ": "));
-          } else {
-            ensemble_tensors.emplace(
-                std::make_pair(output_map.second, model_tensor));
-          }
-          mapped_cnt++;
-        }
-      }
-      if (mapped_cnt > 1) {
-        return Status(
-            RequestStatusCode::INVALID_ARG,
-            "in ensemble " + ensemble + ", multiple outputs in model " +
-                model_config.name() +
-                " are mapped to the same ensemble tensor " + output_map.second);
-      }
-    }
-
-    // link ensemble tensors
-    for (const auto& output_map : step.output_map()) {
-      auto& node = ensemble_tensors.find(output_map.second)->second;
-      for (const auto& input_map : step.input_map()) {
-        auto& prev_node = ensemble_tensors.find(input_map.second)->second;
-        node.prev_nodes.push_back(&prev_node);
-        prev_node.next_nodes.push_back(&node);
-      }
+          " which is not in the available models");
+      // continue to complete the edges of the graph
+      continue;
+    } else {
+      dit->second->downstream_nodes_.emplace(ensemble_node);
+      ensemble_node->upstream_nodes_.emplace(dit->second.get());
     }
   }
-
-  // Check data flow
-  std::deque<TensorNode*> ready_queue;
-  for (const auto& input : ensemble_config.input()) {
-    auto it = ensemble_tensors.find(input.name());
-    it->second.ready = true;
-    ready_queue.push_back(&(it->second));
-  }
-  while (!ready_queue.empty()) {
-    auto& ready_node = ready_queue.front();
-    for (auto& next_node : ready_node->next_nodes) {
-      if (next_node->ready) {
-        continue;
-      }
-      bool next_node_ready = true;
-      for (auto& prev_node : next_node->prev_nodes) {
-        if (!prev_node->ready) {
-          next_node_ready = false;
+  
+  if (ensemble_node->status_.IsOk()) {
+    for (const auto& step : ensemble_config.ensemble_scheduling().step()) {
+      const auto& model_name = step.model_name();
+      ModelConfig model_config;
+      for (auto& node : ensemble_node->upstream_nodes_) {
+        if (model_name == node->model_name_) {
+          model_config = node->model_config_;
           break;
         }
       }
-      next_node->ready = next_node_ready;
-      if (next_node_ready) {
-        ready_queue.push_back(next_node);
+
+      if (model_config.max_batch_size() < ensemble_config.max_batch_size()) {
+        ensemble_node->status_ = Status(
+            RequestStatusCode::INVALID_ARG,
+            "ensemble " + ensemble + " allows maximum batch size " +
+                std::to_string(ensemble_config.max_batch_size()) +
+                ", but it contains model " + model_name +
+                " which only allows maximum batch size to be " +
+                std::to_string(model_config.max_batch_size()));
+        break;
       }
-    }
-    ready_queue.pop_front();
-  }
-  std::set<std::string> ensemble_outputs;
-  for (const auto& output : ensemble_config.output()) {
-    auto it = ensemble_tensors.find(output.name());
-    if (!it->second.ready) {
-      return Status(
-          RequestStatusCode::INVALID_ARG,
-          "in ensemble " + ensemble + ", no data will be written to " +
-              "ensemble output " + output.name());
-    } else {
-      ensemble_outputs.insert(it->first);
-    }
-  }
-  for (const auto& tensor : ensemble_tensors) {
-    if (ensemble_outputs.find(tensor.first) != ensemble_outputs.end()) {
-      continue;
-    }
-    if (!tensor.second.ready) {
-      return Status(
-          RequestStatusCode::INVALID_ARG,
-          "in ensemble " + ensemble + ", ensemble tensor " + tensor.first +
-              " is redundant as no data will be written to it");
-    } else if (tensor.second.next_nodes.size() == 0) {
-      return Status(
-          RequestStatusCode::INVALID_ARG,
-          "in ensemble " + ensemble + ", ensemble tensor " + tensor.first +
-              " is redundant as it will not be used in any models");
+
+      if (model_config.has_ensemble_scheduling()) {
+        bool found = false;
+        for (const auto& name : *ensemble_dependency) {
+          if (name == model_name) {
+            found = true;
+            break;
+          }
+        }
+        if (found) {
+          ensemble_node->status_ = Status(
+              RequestStatusCode::INVALID_ARG,
+              "circular dependency between ensembles: " + model_name + " -> ... -> " +
+                  ensemble + " -> " + model_name);
+          break;
+        }
+
+        if ((ensembles->find(model_name))->second == false) {
+          ensemble_dependency->push_back(ensemble);
+          Status status = ValidateEnsembleConfig(
+              model_name, ensembles, ensemble_dependency, dependency_graph, missing_nodes);
+          ensemble_dependency->pop_back();
+          if (!status.IsOk()) {
+            ensemble_node->status_ = Status(
+                RequestStatusCode::INVALID_ARG,
+                "ensemble " + ensemble + " depends on " + model_name
+                     + " which contains invalid model config");
+            break;
+          }
+        }
+      }
+
+      ensemble_node->status_ = ValidateTensorMapping(ensemble, step, model_config, &ensemble_tensors);
+      if (!ensemble_node->status_.IsOk()) {
+        break;
+      }
     }
   }
 
-  (ensembles.find(ensemble))->second = true;
+  (ensembles->find(ensemble))->second = true;
+  return ensemble_node->status_;
+}
+
+Status
+UpdateDependencyGraph(
+    ModelRepositoryManager* manager,
+    const std::set<std::string>& added, const std::set<std::string>& deleted,
+    const std::set<std::string>& modified,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* dependency_graph,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* missing_nodes)
+{
+  // update dependency graph
+  // keep track of dependents as changes are going to affect downstream instead of upstream
+  
+  // deleted, drop from dependency_graph, add to missing_nodes if downstreams is not empty
+  // affected_nodes are all ensembles as only ensembles are depending on other models
+  std::set<DependencyNode*> affected_nodes;
+  std::set<DependencyNode*> updated_nodes;
+  for (const auto& model_name : deleted) {
+    auto it = dependency_graph->find(model_name);
+    if (it != dependency_graph->end()) {
+      if (!it->second->downstream_nodes_.empty()) {
+        UpdateDownstreamState(&it->second->downstream_nodes_, &affected_nodes);
+        // mark this node as missing upstream node in its downstream nodes
+        for (auto& dependent : it->second->downstream_nodes_) {
+          dependent->missing_upstream_nodes_.emplace(it->second.get());
+        }
+
+        // remove this node from its upstream node
+        for (auto& upstream : it->second->upstream_nodes_) {
+          upstream->downstream_nodes_.erase(it->second.get());
+        }
+        it->second->upstream_nodes_.clear();
+
+        (*missing_nodes)[model_name] = std::move(it->second);
+      }
+      // Make sure deleted node will not be in affected nodes
+      affected_nodes.erase(it->second.get());
+      dependency_graph->erase(it);
+    }
+  }
+
+  // modified, invalidate (uncheck) all downstreams
+  for (const auto& model_name : modified) {
+    auto it = dependency_graph->find(model_name);
+    if (it != dependency_graph->end()) {
+      UpdateDownstreamState(&it->second->downstream_nodes_, &affected_nodes);
+      manager->GetModelConfig(model_name, &it->second->model_config_);
+      it->second->checked_ = false;
+      updated_nodes.emplace(it->second.get());
+    }
+  }
+
+  // added, add to dependency_graph, if in missing_node, invalidate (uncheck) and associate all downstreams, remove from missing_node
+  for (const auto& model_name : added) {
+    std::unique_ptr<DependencyNode> added_node;
+    auto it = missing_nodes->find(model_name);
+    if (it != missing_nodes->end()) {
+      UpdateDownstreamState(&it->second->downstream_nodes_, &affected_nodes);
+      // remove this node from missing upstream node in its downstream nodes
+      for (auto& dependent : it->second->downstream_nodes_) {
+        dependent->missing_upstream_nodes_.erase(it->second.get());
+      }
+
+      it->second->checked_ = false;
+      added_node = std::move(it->second);
+      //(*dependency_graph)[model_name] = std::move(it->second);
+      missing_nodes->erase(it);
+    } else {
+      // Right now, nothing is going to be filled until validation
+      added_node.reset(new DependencyNode(model_name));
+    }
+    manager->GetModelConfig(model_name, &added_node->model_config_);
+    updated_nodes.emplace(added_node.get());
+    dependency_graph->emplace(model_name, std::move(added_node));
+  }
+
+  // [TODO] collect modified configs and ValidateEnsembleConfig() here
+  ValidateEnsembleConfig(updated_nodes, affected_nodes, dependency_graph, missing_nodes);
+  // [TODO] return <valid, invalid> pair?
   return Status::Success;
 }
 
 Status
 ValidateEnsembleConfig(
-    const std::unordered_map<std::string, ModelConfig>& config_map)
+    const std::set<DependencyNode*>& updated_nodes,
+    const std::set<DependencyNode*>& affected_nodes,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* dependency_graph,
+    std::unordered_map<std::string, std::unique_ptr<DependencyNode>>* missing_nodes)
 {
-  std::unordered_map<std::string, std::string> invalid_model_names;
   std::unordered_map<std::string, bool> ensembles;
 
-  for (const auto& pair : config_map) {
-    Status status = ValidateModelConfig(pair.second, std::string());
-    if (!status.IsOk()) {
-      // Return error if the inputs / outputs of one ensemble is not correct.
-      if (pair.second.has_ensemble_scheduling()) {
-        return Status(
-            RequestStatusCode::INVALID_ARG,
-            "ensemble" + pair.first + ": " + status.Message());
-      }
-      invalid_model_names.emplace(pair.first, status.Message());
-    } else if (pair.second.has_ensemble_scheduling()) {
-      ensembles.emplace(std::make_pair(pair.first, false));
+  for (const auto& node : affected_nodes) {
+    ensembles.emplace(std::make_pair(node->model_name_, false));
+  }
+  ModelConfig model_config;
+  for (auto& node : updated_nodes) {
+    if (node->model_config_.has_ensemble_scheduling()) {
+      ensembles.emplace(std::make_pair(node->model_name_, false));
+    } else {
+      // non-ensemble model config should have been checked beforehand.
+      node->checked_ = true;
     }
+    // assume all nodes are valid
+    node->status_ = Status::Success;
   }
 
   std::deque<std::string> ensemble_dependency;
@@ -323,8 +417,7 @@ ValidateEnsembleConfig(
       continue;
     }
     RETURN_IF_ERROR(ValidateEnsembleConfig(
-        pair.first, config_map, invalid_model_names, ensembles,
-        ensemble_dependency));
+        pair.first, &ensembles, &ensemble_dependency, dependency_graph, missing_nodes));
   }
 
   return Status::Success;

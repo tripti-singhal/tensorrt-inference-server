@@ -117,6 +117,13 @@ class ModelRepositoryManager {
       const std::string& model_name, const int64_t model_version,
       std::shared_ptr<InferenceBackend>* backend);
 
+  /// [TODO] const keyword?
+  /// Get the configuration for a named model.
+  /// \param name The model name.
+  /// \param model_config Returns the model configuration.
+  /// \return OK if found, NOT_FOUND otherwise.
+  Status GetModelConfig(const std::string& name, ModelConfig* model_config);
+
  private:
   struct ModelInfo;
   class BackendLifeCycle;
@@ -150,12 +157,6 @@ class ModelRepositoryManager {
   /// \param model_name The name of the model to be updated.
   /// \param is_added If the model is being added to the model repository.
   Status Update(const std::string& model_name, bool is_added);
-
-  /// Get the configuration for a named model.
-  /// \param name The model name.
-  /// \param model_config Returns the model configuration.
-  /// \return OK if found, NOT_FOUND otherwise.
-  Status GetModelConfig(const std::string& name, ModelConfig* model_config);
 
   /// Get the list of versions to be loaded for a named model based on version
   /// policy.
