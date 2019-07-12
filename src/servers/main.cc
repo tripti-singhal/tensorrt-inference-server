@@ -133,6 +133,7 @@ enum OptionId {
   OPTION_EXIT_TIMEOUT_SECS,
   OPTION_TF_ALLOW_SOFT_PLACEMENT,
   OPTION_TF_GPU_MEMORY_FRACTION,
+  OPTION_TF_ADD_VGPU,
 };
 
 struct Option {
@@ -218,7 +219,13 @@ std::vector<Option> options_{
      "Reserve a portion of GPU memory for TensorFlow models. Default "
      "value 0.0 indicates that TensorFlow should dynamically allocate "
      "memory as needed. Value of 1.0 indicates that TensorFlow should "
-     "allocate all of GPU memory."}};
+     "allocate all of GPU memory."},
+    {OPTION_TF_ADD_VGPU, "tf-add-vgpu",
+     "Add a tensorflow virtual GPU instance on a physical GPU. This option can"
+     "be used multiple times.Input should be 2 integers and 1 float separated"
+     "by semicolons in the format"
+     "<physical GPU>;<number of virtual GPUs>;<memory limit for physical GPU>"
+     "By default, no VGPUs are enabled."}};
 
 
 void
@@ -422,6 +429,54 @@ ParseFloatOption(const std::string arg)
   return std::stof(arg);
 }
 
+std::pair<int, std::vector<float>>
+ParseVGPUOption(const std::string arg, bool* malformed)
+{
+  std::vector<float> mem_limits_per_vgpu(0);
+
+  int delim_gpu = arg.find(";");
+  int delim_num_vgpus = arg.find(";", delim_gpu + 1);
+
+  // Check for 2 semicolons
+  if ((delim_gpu < 0) || (delim_num_vgpus < 0)) {
+    *malformed = true;
+    LOG_ERROR << "Cannot add virtual devices due to malformed TF-VGPU setting "
+              << arg;
+  }
+
+  std::string gpu_string = arg.substr(0, delim_gpu);
+  std::string vgpu_string =
+      arg.substr(delim_gpu + 1, delim_num_vgpus - delim_gpu - 1);
+  std::string mem_limit_string = arg.substr(delim_num_vgpus + 1);
+
+  // Ensure that options are non-empty otherwise calling stoi/stof will throw an
+  // exception
+  if (gpu_string.empty() || vgpu_string.empty() || mem_limit_string.empty()) {
+    *malformed = true;
+    LOG_ERROR << "Cannot add virtual devices due to malformed TF-VGPU setting "
+              << arg;
+    return std::make_pair(-1, mem_limits_per_vgpu);
+  }
+
+  int gpu_device = std::stoi(gpu_string);
+  int num_vgpus_on_device = std::stoi(vgpu_string);
+  float mem_limit = std::stof(mem_limit_string);
+
+  if (num_vgpus_on_device <= 0) {
+    LOG_ERROR << "Cannot add virtual devices due to invalid number of VGPUs "
+              << arg;
+    *malformed = true;
+    return std::make_pair(-1, mem_limits_per_vgpu);
+  }
+
+  // Compute map element
+  float limit_per_vgpu = mem_limit / num_vgpus_on_device;
+  mem_limits_per_vgpu.insert(
+      mem_limits_per_vgpu.end(), num_vgpus_on_device, limit_per_vgpu);
+
+  return std::make_pair(gpu_device, mem_limits_per_vgpu);
+}
+
 bool
 Parse(nvidia::inferenceserver::InferenceServer* server, int argc, char** argv)
 {
@@ -432,6 +487,8 @@ Parse(nvidia::inferenceserver::InferenceServer* server, int argc, char** argv)
   bool allow_profiling = server->ProfilingEnabled();
   bool tf_allow_soft_placement = server->TensorFlowSoftPlacementEnabled();
   float tf_gpu_memory_fraction = server->TensorFlowGPUMemoryFraction();
+  std::map<int, std::vector<float>> tf_vgpu =
+      server->TensorFlowVGPUMemoryLimits();
   int32_t exit_timeout_secs = server->ExitTimeoutSeconds();
   int32_t repository_poll_secs = server->RepositoryPollSeconds();
 
@@ -553,6 +610,14 @@ Parse(nvidia::inferenceserver::InferenceServer* server, int argc, char** argv)
       case OPTION_TF_GPU_MEMORY_FRACTION:
         tf_gpu_memory_fraction = ParseFloatOption(optarg);
         break;
+      case OPTION_TF_ADD_VGPU:
+        bool malformed;
+        std::pair<int, std::vector<float>> map_element =
+            ParseVGPUOption(optarg, &malformed);
+        if (!malformed) {
+          tf_vgpu[map_element.first] = map_element.second;
+        }
+        break;
     }
   }
 
@@ -605,7 +670,7 @@ Parse(nvidia::inferenceserver::InferenceServer* server, int argc, char** argv)
 
   server->SetTensorFlowSoftPlacementEnabled(tf_allow_soft_placement);
   server->SetTensorFlowGPUMemoryFraction(tf_gpu_memory_fraction);
-
+  server->SetTensorFlowVGPUMemoryLimits(tf_vgpu);
   return true;
 }
 }  // namespace

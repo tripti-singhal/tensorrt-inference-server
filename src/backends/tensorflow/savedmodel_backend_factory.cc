@@ -51,7 +51,10 @@ SavedModelBackendFactory::Create(
       std::static_pointer_cast<GraphDefBackendFactory::Config>(backend_config);
   factory->reset(new SavedModelBackendFactory(savedmodel_backend_config));
 
-  VirtualDeviceTracker::Init(savedmodel_backend_config->memory_limit_mb);
+  // Initialize VGPUs if required
+  if (!savedmodel_backend_config->memory_limit_mb.empty()) {
+    VirtualDeviceTracker::Init(savedmodel_backend_config->memory_limit_mb);
+  }
 
   return Status::Success;
 }
