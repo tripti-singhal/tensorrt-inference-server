@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <future>
 #include <stdexcept>
 #include <thread>
 #include "src/core/backend.h"
@@ -242,9 +243,9 @@ class ModelRepositoryManager::BackendLifeCycle {
   // If 'force_unload', all versions that are being served will
   // be unloaded before loading the specified versions.
   Status AsyncLoad(
-      const std::string& model_name, const std::vector<int64_t>& versions,
+      const std::string& model_name, const std::set<int64_t>& versions,
       const ModelConfig& model_config, bool force_unload = true,
-      std::function<void()> OnComplete = nullptr);
+      std::function<void(int64_t, ModelReadyState, size_t)> OnComplete = nullptr);
 
   // Get specified model version's backend. Latest ready version will
   // be retrieved if 'version' is -1. Return error if the version specified is
@@ -278,6 +279,8 @@ class ModelRepositoryManager::BackendLifeCycle {
     // while the backend is already in loading / unloading state. Then the new
     // load / unload will be postponed as next action.
     ActionType next_action_;
+    // callback function that will be triggered when there is no next action
+    std::function<void()> OnComplete_;
     ModelConfig model_config_;
 
     std::shared_ptr<InferenceBackend> backend_;
@@ -517,9 +520,9 @@ ModelRepositoryManager::BackendLifeCycle::GetInferenceBackend(
 
 Status
 ModelRepositoryManager::BackendLifeCycle::AsyncLoad(
-    const std::string& model_name, const std::vector<int64_t>& versions,
+    const std::string& model_name, const std::set<int64_t>& versions,
     const ModelConfig& model_config, bool force_unload,
-    std::function<void()> OnComplete)
+    std::function<void(int64_t, ModelReadyState, size_t)> OnComplete)
 {
   LOG_VERBOSE(1) << "AsyncLoad() '" << model_name << "'";
   std::lock_guard<std::mutex> map_lock(map_mtx_);
@@ -528,34 +531,44 @@ ModelRepositoryManager::BackendLifeCycle::AsyncLoad(
     it = map_.emplace(std::make_pair(model_name, VersionMap())).first;
   }
 
-  if (force_unload) {
-    for (auto& version_backend : it->second) {
-      std::lock_guard<std::recursive_mutex> lock(version_backend.second->mtx_);
-      version_backend.second->next_action_ = ActionType::UNLOAD;
-      TriggerNextAction(
-          model_name, version_backend.first, version_backend.second.get());
-    }
-  }
-
   for (const auto& version : versions) {
-    auto vit = it->second.find(version);
-    if (vit == it->second.end()) {
-      vit =
+    auto res =
           it->second
-              .emplace(std::make_pair(version, std::unique_ptr<BackendInfo>()))
-              .first;
-      vit->second.reset(new BackendInfo(
+              .emplace(std::make_pair(version, std::unique_ptr<BackendInfo>()));
+    if (res.second) {
+      res.first->second.reset(new BackendInfo(
           ModelReadyState::MODEL_UNKNOWN, ActionType::NO_ACTION, model_config));
     }
-
-    // Update model config and reload model if it is being served
-    std::lock_guard<std::recursive_mutex> lock(vit->second->mtx_);
-    vit->second->model_config_ = model_config;
-    vit->second->next_action_ = ActionType::LOAD;
-    RETURN_IF_ERROR(TriggerNextAction(model_name, version, vit->second.get()));
   }
 
-  return Status::Success;
+  Status status = Status::Success;
+  size_t affected_version_cnt = force_unload ? it->second.size() : versions.size();
+  for (auto& version_backend : it->second) {
+    std::lock_guard<std::recursive_mutex> lock(version_backend.second->mtx_);
+    if (versions.find(version_backend.first) != versions.end()) {
+      version_backend.second->model_config_ = model_config;
+      version_backend.second->next_action_ = ActionType::LOAD;
+    } else if (force_unload) {
+      version_backend.second->next_action_ = ActionType::UNLOAD;
+    }
+
+    auto version = version_backend.first;
+    auto backend_info = version_backend.second.get();
+    // set version-wise callback before triggering next action
+    if (OnComplete != nullptr) {
+      version_backend.second->OnComplete_ = [version, backend_info, affected_version_cnt, OnComplete](){
+        OnComplete(version, backend_info->state_, affected_version_cnt);
+      };
+    }
+    Status action_status = TriggerNextAction(
+        model_name, version, backend_info);
+    // Only care about status on unloading case [TODO] even doesn't matter
+    if (!action_status.IsOk() && versions.empty()) {
+      status = action_status;
+    }
+  }
+
+  return status;
 }
 
 Status
@@ -568,21 +581,33 @@ ModelRepositoryManager::BackendLifeCycle::TriggerNextAction(
                  << std::to_string(backend_info->next_action_);
   ActionType next_action = backend_info->next_action_;
   backend_info->next_action_ = ActionType::NO_ACTION;
+  Status status = Status::Success;
   switch (next_action) {
     case ActionType::LOAD:
       Unload(model_name, version, backend_info);
-      RETURN_IF_ERROR(Load(model_name, version, backend_info));
+      status = Load(model_name, version, backend_info);
       break;
     case ActionType::UNLOAD:
-      RETURN_IF_ERROR(Unload(model_name, version, backend_info));
+      status = Unload(model_name, version, backend_info);
       break;
     default:
-      // [TODO] Any change on the model version is completed, trigger
-      // OnComplete call back if any
+      if (backend_info->OnComplete_ != nullptr) {
+        LOG_VERBOSE(1) << "no next action, trigger OnComplete()";
+        backend_info->OnComplete_();
+        backend_info->OnComplete_ = nullptr;
+      }
       break;
   }
 
-  return Status::Success;
+  // If status is not ok, "next action" path ends here and thus need to
+  // invoke callback by this point
+  if ((!status.IsOk()) && (backend_info->OnComplete_ != nullptr)) {
+    LOG_VERBOSE(1) << "failed to execute next action, trigger OnComplete()";
+    backend_info->OnComplete_();
+    backend_info->OnComplete_ = nullptr;
+  }
+
+  return status;
 }
 
 Status
@@ -850,7 +875,7 @@ ModelRepositoryManager::PollAndUpdate()
 
   for (const auto& name : deleted) {
     ModelConfig model_config;
-    std::vector<int64_t> versions;
+    std::set<int64_t> versions;
     // Utilize "force_unload" of AsyncLoad()
     backend_life_cycle_->AsyncLoad(name, versions, model_config);
   }
@@ -886,35 +911,68 @@ ModelRepositoryManager::Update(
 Status
 ModelRepositoryManager::LoadModelByDependency()
 {
+  struct ModelState {
+    ModelState(const std::string& model_name)
+      : model_name_(model_name) {}
+    const std::string model_name_;
+    std::set<int64_t> loaded_versions_;
+    std::set<int64_t> unloaded_versions_;
+    std::mutex mtx_;
+    std::promise<void> ready_;
+  };
   std::unordered_map<std::string, std::set<int64_t>> loaded_models;
   auto set_pair = ModelsToLoad(loaded_models, &dependency_graph_);
   // Loop until all model are loaded / unloaded
-  while ((!set_pair.first.empty()) && (!set_pair.second.empty())) {
+  while ((!set_pair.first.empty()) || (!set_pair.second.empty())) {
+    loaded_models.clear();
     // Unload invalid models first
     for (const auto& invalid_model : set_pair.second) {
       ModelConfig model_config;
-      std::vector<int64_t> versions;
+      std::set<int64_t> versions;
       // Utilize "force_unload" of AsyncLoad()
       backend_life_cycle_->AsyncLoad(invalid_model, versions, model_config);
+      // [TODO] print error here
+      auto node = dependency_graph_.find(invalid_model)->second.get();
+      LOG_ERROR << node->status_.AsString();
+      loaded_models[invalid_model] = std::set<int64_t>();
     }
     // load valid models and wait for load results
+    std::vector<std::unique_ptr<ModelState>> model_states;
     for (const auto& valid_model : set_pair.first) {
-      // [TODO] Shouldn't return on error, things have changed
+      model_states.emplace_back(new ModelState(valid_model));
+      auto model_state = model_states.back().get();
       auto node = dependency_graph_.find(valid_model)->second.get();
-      std::vector<int64_t> versions;
+      std::set<int64_t> versions;
       Status status;
       status = VersionsToLoad(valid_model, node->model_config_, versions);
       // [TODO] needs some form of callback and cv
       // so that the manager will wait until current stage is finished
       if (status.IsOk()) {
-        status = backend_life_cycle_->AsyncLoad(valid_model, versions, node->model_config_);
+        status = backend_life_cycle_->AsyncLoad(valid_model, versions, node->model_config_, true,
+        [model_state](int64_t version, ModelReadyState state, size_t total_version_cnt){
+          std::lock_guard<std::mutex> lk(model_state->mtx_);
+          if (state == ModelReadyState::MODEL_READY) {
+            model_state->loaded_versions_.emplace(version);
+          } else {
+            model_state->unloaded_versions_.emplace(version);
+          }
+          if ((model_state->loaded_versions_.size() + model_state->unloaded_versions_.size()) == total_version_cnt) {
+            model_state->ready_.set_value();
+          }
+        });
       }
       if (!status.IsOk()) {
+        model_states.pop_back();
         LOG_ERROR << "failed to load model '" << valid_model
                   << "': " << status.Message();
         node->status_ = status;
       }
-    } 
+    }
+    for (auto& model_state : model_states) {
+      model_state->ready_.get_future().wait();
+      loaded_models[model_state->model_name_] = model_state->loaded_versions_;
+    }
+    set_pair = ModelsToLoad(loaded_models, &dependency_graph_);
   }
   return Status::Success;
 }
@@ -940,7 +998,7 @@ ModelRepositoryManager::UnloadAllModels()
   Status status;
   // Reload an empty version list to cause the model to unload.
   ModelConfig model_config;
-  std::vector<int64_t> versions;
+  std::set<int64_t> versions;
   for (const auto& name_info : infos_) {
     Status unload_status =
         backend_life_cycle_->AsyncLoad(name_info.first, versions, model_config);
@@ -1114,7 +1172,7 @@ ModelRepositoryManager::GetModelConfig(
 Status
 ModelRepositoryManager::VersionsToLoad(
     const std::string& name, const ModelConfig& model_config,
-    std::vector<int64_t>& versions)
+    std::set<int64_t>& versions)
 {
   versions.clear();
 
@@ -1139,7 +1197,7 @@ ModelRepositoryManager::VersionsToLoad(
       // Only load the specific versions that are presented in model directory
       bool version_not_exist = existing_versions.insert(v).second;
       if (!version_not_exist) {
-        versions.push_back(v);
+        versions.emplace(v);
       } else {
         LOG_ERROR << "version " << v << " is specified for model '" << name
                   << "', but the version directory is not present";
@@ -1153,11 +1211,11 @@ ModelRepositoryManager::VersionsToLoad(
             model_config.version_policy().latest().num_versions()) {
           break;
         }
-        versions.push_back(v);
+        versions.emplace(v);
       }
     } else {
       // all
-      versions.assign(existing_versions.begin(), existing_versions.end());
+      versions.insert(existing_versions.begin(), existing_versions.end());
     }
   }
 

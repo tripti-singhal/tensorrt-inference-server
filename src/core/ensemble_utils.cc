@@ -177,7 +177,9 @@ ValidateTensorConsistency(
   bool consistent = (lhs.dims_.size() == rhs.dims_.size());
   if (consistent) {
     for (int i = 0; i < lhs.dims_.size(); i++) {
-      if (lhs.dims_[i] != rhs.dims_[i]) {
+      // [TODO] relax to allow mapping between fixed size, variable size
+      // should be more strict?
+      if ((lhs.dims_[i] != rhs.dims_[i]) && ((lhs.dims_[i] != -1) && (rhs.dims_[i] != -1))) {
         consistent = false;
         break;
       }
@@ -212,11 +214,13 @@ ValidateEnsembleConfig(
       dependency_graph->find(ensemble)->second->model_config_;
 
   for (const auto& input : ensemble_config.input()) {
-    TensorNode input_node(ensemble, input.data_type(), input.dims());
+    const auto& dims = input.has_reshape() ? input.reshape().shape() : input.dims();
+    TensorNode input_node(ensemble, input.data_type(), dims);
     ensemble_tensors.emplace(std::make_pair(input.name(), input_node));
   }
   for (const auto& output : ensemble_config.output()) {
-    TensorNode output_node(ensemble, output.data_type(), output.dims());
+    const auto& dims = output.has_reshape() ? output.reshape().shape() : output.dims();
+    TensorNode output_node(ensemble, output.data_type(), dims);
     ensemble_tensors.emplace(std::make_pair(output.name(), output_node));
   }
 
@@ -313,7 +317,7 @@ ValidateEnsembleConfig(
   }
 
   (ensembles->find(ensemble))->second = true;
-  return ensemble_node->status_;
+  return Status::Success;
 }
 
 Status
@@ -350,7 +354,7 @@ UpdateDependencyGraph(
         }
         it->second->upstream_nodes_.clear();
 
-        (*missing_nodes)[model_name] = std::move(it->second);
+        missing_nodes->emplace(std::make_pair(model_name, std::move(it->second)));
       }
       // Make sure deleted node will not be in affected nodes
       affected_nodes.erase(it->second.get());
@@ -396,7 +400,7 @@ UpdateDependencyGraph(
     }
     manager->GetModelConfig(model_name, &added_node->model_config_);
     updated_nodes.emplace(added_node.get());
-    dependency_graph->emplace(model_name, std::move(added_node));
+    dependency_graph->emplace(std::make_pair(model_name, std::move(added_node)));
   }
 
   // [TODO] collect modified configs and ValidateEnsembleConfig() here
@@ -424,9 +428,6 @@ ValidateEnsembleConfig(
   for (auto& node : updated_nodes) {
     if (node->model_config_.has_ensemble_scheduling()) {
       ensembles.emplace(std::make_pair(node->model_name_, false));
-    } else {
-      // non-ensemble model config should have been checked beforehand.
-      node->checked_ = true;
     }
     // assume all nodes are valid
     node->status_ = Status::Success;
@@ -437,9 +438,9 @@ ValidateEnsembleConfig(
     if (pair.second) {
       continue;
     }
-    RETURN_IF_ERROR(ValidateEnsembleConfig(
+    ValidateEnsembleConfig(
         pair.first, &ensembles, &ensemble_dependency, dependency_graph,
-        missing_nodes));
+        missing_nodes);
   }
 
   return Status::Success;
@@ -453,6 +454,7 @@ ModelsToLoad(
 {
   std::pair<std::set<std::string>, std::set<std::string>> res;
   // first call to this function
+  // [TODO] update status_ to be invalid and mark checked
   if (loaded_models.empty()) {
     for (auto& pair : (*dependency_graph)) {
       auto& node = pair.second;
@@ -470,19 +472,20 @@ ModelsToLoad(
               break;
             }
             if (!upstream.first->status_.IsOk()) {
-              node_valid = false;
-              break;
-            }
-            // check if the required version of upstream is loaded
-            if (upstream.first->loaded_versions_.empty()) {
-              node_valid = false;
+              node->status_ = Status(RequestStatusCode::INVALID_ARG, "ensemble '" + node->model_name_ + "' depends on '" + upstream.first->model_name_ + "' which is not valid");
+            } else if (upstream.first->loaded_versions_.empty()) {
+              node->status_ = Status(RequestStatusCode::INVALID_ARG, "ensemble '" + node->model_name_ + "' depends on '" + upstream.first->model_name_ + "' which has no loaded version");
               break;
             } else if (upstream.second != -1) {
-              auto it = upstream.first->loaded_versions_.find(upstream.second);
+              auto it =
+                  upstream.first->loaded_versions_.find(upstream.second);
               if (it == upstream.first->loaded_versions_.end()) {
-                node_valid = false;
-                break;
+                node->status_ = Status(RequestStatusCode::INVALID_ARG, "ensemble '" + node->model_name_ + "' depends on '" + upstream.first->model_name_ + "' whose required version is not loaded");
               }
+            }
+            if (!node->status_.IsOk()) {
+              node_valid = false;
+              break;
             }
           }
           if (node_ready) {
@@ -519,20 +522,20 @@ ModelsToLoad(
                 break;
               }
               if (!upstream.first->status_.IsOk()) {
-                node_valid = false;
-                break;
-              }
-              // check if the required version of upstream is loaded
-              if (upstream.first->loaded_versions_.empty()) {
-                node_valid = false;
+                node->status_ = Status(RequestStatusCode::INVALID_ARG, "ensemble '" + node->model_name_ + "' depends on '" + upstream.first->model_name_ + "' which is not valid");
+              } else if (upstream.first->loaded_versions_.empty()) {
+                node->status_ = Status(RequestStatusCode::INVALID_ARG, "ensemble '" + node->model_name_ + "' depends on '" + upstream.first->model_name_ + "' which has no loaded version");
                 break;
               } else if (upstream.second != -1) {
                 auto it =
                     upstream.first->loaded_versions_.find(upstream.second);
                 if (it == upstream.first->loaded_versions_.end()) {
-                  node_valid = false;
-                  break;
+                  node->status_ = Status(RequestStatusCode::INVALID_ARG, "ensemble '" + node->model_name_ + "' depends on '" + upstream.first->model_name_ + "' whose required version is not loaded");
                 }
+              }
+              if (!node->status_.IsOk()) {
+                node_valid = false;
+                break;
               }
             }
             if (node_ready) {
