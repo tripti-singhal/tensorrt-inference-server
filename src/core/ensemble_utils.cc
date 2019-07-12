@@ -317,7 +317,7 @@ ValidateEnsembleConfig(
   }
 
   (ensembles->find(ensemble))->second = true;
-  return Status::Success;
+  return ensemble_node->status_;
 }
 
 Status
